@@ -10,10 +10,14 @@ from aiogram.filters import CommandStart
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 
+# ИСПРАВЛЕНИЕ: Импортируем класс для передачи дефолтных параметров в aiogram 3.7+
+from aiogram.client.default import DefaultBotProperties
+
 # Токен твоего бота (получи в @BotFather)
 BOT_TOKEN = "8987822827:AAHM6Fnaijb-UCLvuEu5q_MaVQD3nl5h0go"
 
-bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+# ИСПРАВЛЕНИЕ: Передаем parse_mode через DefaultBotProperties, как этого требует новая версия aiogram
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
 # --- МЕНЕДЖЕР РОТАЦИИ API КЛЮЧЕЙ ---
@@ -234,4 +238,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
+        
