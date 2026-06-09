@@ -6,7 +6,8 @@ import asyncio
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.utils.markdown import escape_md
+# ИСПРАВЛЕНО: Используем правильный инструмент для экранирования в aiogram 3.x
+from aiogram.utils.markdown import markdown_decoration as md
 
 from google import genai
 from google.genai import types as genai_types
@@ -178,14 +179,13 @@ async def safe_edit_text(target_message: types.Message, text: str) -> None:
         return
     text = _strip_fences(text)
     try:
-        await target_message.edit_text(escape_md(text), parse_mode="MarkdownV2")
+        # ИСПРАВЛЕНО: В aiogram 3 экранирование делается через md.quote()
+        await target_message.edit_text(md.quote(text), parse_mode="MarkdownV2")
     except TelegramBadRequest as e:
         logging.warning(f"MarkdownV2 edit упал ({e}), отправляю plain.")
-        # Пытаемся без разметки
         try:
             await target_message.edit_text(text)
         except TelegramBadRequest:
-            # Если не влезло — шлём кусками
             for chunk in _trim_entities(text):
                 await target_message.chat.send_message(chunk)
 
@@ -195,7 +195,8 @@ async def safe_answer(target_message: types.Message, text: str) -> types.Message
         return None
     text = _strip_fences(text)
     try:
-        return await target_message.answer(escape_md(text), parse_mode="MarkdownV2")
+        # ИСПРАВЛЕНО: В aiogram 3 экранирование делается через md.quote()
+        return await target_message.answer(md.quote(text), parse_mode="MarkdownV2")
     except TelegramBadRequest as e:
         logging.warning(f"MarkdownV2 answer упал ({e}), отправляю plain.")
         try:
@@ -219,7 +220,6 @@ async def process_start_command(message: types.Message):
         "_Выберите режим кнопкой ниже, затем отправьте цель для анализа._"
     )
     await safe_answer(message, welcome_text)
-    # Отдельно отправляем клавиатуру, чтобы разметка не ломала её
     await message.answer(
         "👇 *Панель управления:*",
         parse_mode="MarkdownV2",
@@ -232,13 +232,15 @@ async def on_mode_callback(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     action = callback.data.split(":", 1)[1]
 
+    # ИСПРАВЛЕНО: Для редактирования сообщений внутри callback-хэндлеров aiogram 3 используется callback.message.edit_text
     if action == "restart":
         user_modes.pop(user_id, None)
-        await callback.message.edit_text(
-            "🔄 *Сессия сброшена\\.*\n\nВыберите режим заново:",
-            parse_mode="MarkdownV2",
-            reply_markup=get_inline_keyboard()
-        )
+        if callback.message:
+            await callback.message.edit_text(
+                "🔄 *Сессия сброшена\\.*\n\nВыберите режим заново:",
+                parse_mode="MarkdownV2",
+                reply_markup=get_inline_keyboard()
+            )
         await callback.answer("Сессия сброшена")
         return
 
@@ -251,12 +253,15 @@ async def on_mode_callback(callback: types.CallbackQuery):
     }
     user_modes[user_id] = action
     title = title_map.get(action, action)
-    await callback.message.edit_text(
-        f"✅ *Режим активирован:* {escape_md(title)}\n\n"
-        f"_Отправьте цель для анализа\\._",
-        parse_mode="MarkdownV2",
-        reply_markup=get_inline_keyboard()
-    )
+    
+    if callback.message:
+        # ИСПРАВЛЕНО: Экранирование через md.quote()
+        await callback.message.edit_text(
+            f"✅ *Режим активирован:* {md.quote(title)}\n\n"
+            f"_Отправьте цель для анализа\\._",
+            parse_mode="MarkdownV2",
+            reply_markup=get_inline_keyboard()
+        )
     await callback.answer(f"Режим: {title}")
 
 # ==========================================
@@ -337,7 +342,7 @@ async def handle_osint_request(message: types.Message):
     if final_response:
         final_response = final_response.replace("[TRIGGER_CASCADE_PRO]", "").strip()
         if len(final_response) > 4096:
-            chunks = _trim_entities(final_response, 3500)  # запас под экранирование
+            chunks = _trim_entities(final_response, 3500)
             try:
                 await status_msg.delete()
             except Exception:
@@ -358,6 +363,8 @@ async def handle_osint_request(message: types.Message):
 @dp.message(F.photo)
 async def handle_geo_photo(message: types.Message, bot: Bot):
     status_msg = await safe_answer(message, "📸 Получено изображение. Запускаю визуальную деконструкцию объекта...")
+    if not status_msg:
+        status_msg = await message.answer("📸 Получено изображение. Запускаю визуальную деконструкцию объекта...")
 
     photo = message.photo[-1]
     file_info = await bot.get_file(photo.file_id)
@@ -433,3 +440,4 @@ async def start_application():
 
 if __name__ == "__main__":
     asyncio.run(start_application())
+    
