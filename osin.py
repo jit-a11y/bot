@@ -1,15 +1,18 @@
 import os
+import re
 import time
 import logging
 import asyncio
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.utils.markdown import escape_md
 
 from google import genai
 from google.genai import types as genai_types
 
 # ==========================================
-# КОНФИГУРАЦИЯ И НАСТРОЙКА ЛОГИРОВАНИЯ
+# КОНФИГУРАЦИЯ И ЛОГИРОВАНИЕ
 # ==========================================
 logging.basicConfig(
     level=logging.INFO,
@@ -20,44 +23,37 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GOOGLE_API_KEYS_RAW = os.getenv("GOOGLE_API_KEYS")
 
 if not TELEGRAM_BOT_TOKEN:
-    logging.critical("🚨 Ошибка: Переменная окружения 'TELEGRAM_BOT_TOKEN' не установлена!")
+    logging.critical("🚨 TELEGRAM_BOT_TOKEN не установлен!")
 if not GOOGLE_API_KEYS_RAW:
-    logging.critical("🚨 Ошибка: Переменная окружения 'GOOGLE_API_KEYS' не установлена!")
+    logging.critical("🚨 GOOGLE_API_KEYS не установлен!")
 
 MODEL_OSINT_FLASH = "gemini-2.5-flash"
 MODEL_GEO_PRO = "gemini-2.5-flash"
 
-# ==========================================
-# РЕЖИМЫ РАБОТЫ ПОЛЬЗОВАТЕЛЕЙ
-# ==========================================
 user_modes = {}
 
 # ==========================================
-# ИНТЕЛЛЕКТУАЛЬНЫЙ СУПЕР-РОТАТОР КЛЮЧЕЙ
+# РОТАТОР КЛЮЧЕЙ
 # ==========================================
 class AdvancedSmartRotator:
     def __init__(self, raw_keys_string: str):
         if not raw_keys_string:
             self.pool = {}
             return
-        keys = [key.strip() for key in raw_keys_string.split(",") if key.strip()]
+        keys = [k.strip() for k in raw_keys_string.split(",") if k.strip()]
         self.pool = {
-            key: {
-                "errors": 0,
-                "blocked_until": 0.0,
-                "success_count": 0,
-                "weight": 100
-            } for key in keys
+            key: {"errors": 0, "blocked_until": 0.0,
+                  "success_count": 0, "weight": 100}
+            for key in keys
         }
-        logging.info(f"Загружен пул из {len(self.pool)} API-ключей из Environment Variables.")
+        logging.info(f"Загружен пул из {len(self.pool)} API-ключей.")
 
     def get_best_key(self) -> str:
         now = time.time()
         if not self.pool:
-            raise ValueError("Пул API-ключей пуст. Проверьте переменную GOOGLE_API_KEYS в Railway.")
+            raise ValueError("Пул API-ключей пуст. Проверьте GOOGLE_API_KEYS в Railway.")
         active_pool = {k: v for k, v in self.pool.items() if v["blocked_until"] < now}
         if not active_pool:
-            logging.critical("🚨 ВСЕ АККАУНТЫ ЗАБЛОКИРОВАНЫ ЛИМИТАМИ! Вынужденный выбор наименее пострадавшего.")
             sorted_by_ban = sorted(self.pool.items(), key=lambda x: x[1]["blocked_until"])
             return sorted_by_ban[0][0]
         sorted_keys = sorted(
@@ -65,7 +61,7 @@ class AdvancedSmartRotator:
             key=lambda x: (x[1]["errors"], -x[1]["weight"], -x[1]["success_count"])
         )
         best_key = sorted_keys[0][0]
-        logging.info(f"🎯 Выбран оптимальный ключ: {best_key[:12]}... [Ошибок: {self.pool[best_key]['errors']}, Успехов: {self.pool[best_key]['success_count']}]")
+        logging.info(f"🎯 Выбран ключ: {best_key[:12]}... [Ошибок: {self.pool[best_key]['errors']}, Успехов: {self.pool[best_key]['success_count']}]")
         return best_key
 
     def report_success(self, key: str):
@@ -79,156 +75,198 @@ class AdvancedSmartRotator:
         self.pool[key]["weight"] = max(0, self.pool[key]["weight"] - 25)
         if is_quota_issue:
             self.pool[key]["blocked_until"] = time.time() + 75
-            logging.warning(f"🛑 Ключ {key[:12]}... заблокирован лимитами (429). Бан на 75 сек.")
+            logging.warning(f"🛑 {key[:12]}... 429-бан на 75 сек.")
         else:
             self.pool[key]["blocked_until"] = time.time() + 15
-            logging.warning(f"⚠️ Ключ {key[:12]}... выдал ошибку среды. Кулдаун 15 сек.")
+            logging.warning(f"⚠️ {key[:12]}... кулдаун 15 сек.")
 
 rotator = AdvancedSmartRotator(GOOGLE_API_KEYS_RAW or "")
 dp = Dispatcher()
 
 # ==========================================
-# ИНСТРУКЦИИ ДЛЯ СИСТЕМЫ (SYSTEM PROMPTS)
+# СИСТЕМНЫЕ ПРОМПТЫ
 # ==========================================
 OSINT_SYSTEM_INSTRUCTION = """
-Ты — старший аналитик автономного OSINT-терминала. Твоя цель — собрать, сопоставить и структурировать информацию из открытых источников по входящему запросу.
+Ты — старший аналитик автономного OSINT-терминала. Собери, сопоставь и структурируй информацию из открытых источников.
 Запрос может содержать: Telegram ID, юзернейм, номер телефона, email, ФИО, IP-адрес, домен, хэши или никнеймы.
-Используй инструменты поиска для проверки глобальной сети, утечек, упоминаний на форумах, в репозиториях и соцсетях.
-Если предоставленных данных критически мало для развернутого отчета, или поисковая выдача пуста, ты ОБЯЗАН включить в ответ маркер: [TRIGGER_CASCADE_PRO].
+Если предоставленных данных критически мало для развернутого отчета, или поисковая выдача пуста, добавь в ответ маркер: [TRIGGER_CASCADE_PRO].
 
-**Форматирование ответа (ОБЯЗАТЕЛЬНО):**
-- Весь основной текст должен быть выделен **жирным шрифтом**.
-- Для второстепенных замечаний, дат и источников используй _курсив_.
-- Для критических выводов, предупреждений и ключевых зацепок используй цитирование (> текст).
-- Приводи прямые ссылки на источники.
-- Оформляй блоки markdown-списками.
-- Ответ должен быть максимально лаконичным, не более 500 токенов.
+**Форматирование (MarkdownV2):**
+- Основной текст — **жирным**.
+- Второстепенное — _курсивом_.
+- Критические выводы и предупреждения — цитатой (> текст).
+- Прямые ссылки на источники.
+- Списки markdown.
+- Лаконично, не более 500 токенов.
 """
 
 PHONE_SYSTEM_INSTRUCTION = """
-Ты — специалист по телефонной разведке. Проведи детальный анализ номера телефона: оператор, регион, упоминания в базах данных, мессенджерах, объявлениях, соцсетях.
-Проверь связанные аккаунты, утечки и историю активности.
+Ты — специалист по телефонной разведке. Оператор, регион, упоминания в базах, мессенджерах, объявлениях, соцсетях.
+Связанные аккаунты, утечки, история активности.
 
-**Форматирование ответа (ОБЯЗАТЕЛЬНО):**
-- Весь основной текст должен быть выделен **жирным шрифтом**.
-- Для второстепенных замечаний используй _курсив_.
-- Для критических выводов используй цитирование (> текст).
-- Максимальная конкретика и лаконичность. Не более 500 токенов.
+**Форматирование (MarkdownV2):**
+- **жирный** основной текст, _курсив_ для деталей, > цитата для критических выводов.
+- Не более 500 токенов.
 """
 
 EMAIL_SYSTEM_INSTRUCTION = """
-Ты — аналитик по цифровой разведке. Проведи расследование по email-адресу или домену: регистрационные данные, связанные аккаунты, утечки, MX-записи, поддомены, история веб-архивов.
-Выяви связи с другими цифровыми активами.
+Ты — аналитик цифровой разведки. Регистрационные данные, связанные аккаунты, утечки, MX-записи, поддомены, веб-архивы.
+Связи с другими цифровыми активами.
 
-**Форматирование ответа (ОБЯЗАТЕЛЬНО):**
-- Весь основной текст должен быть выделен **жирным шрифтом**.
-- Для второстепенных замечаний используй _курсив_.
-- Для критических выводов используй цитирование (> текст).
-- Не более 500 токенов.
+**Форматирование (MarkdownV2):** **жирный** основной, _курсив_ детали, > цитата выводы. До 500 токенов.
 """
 
 NICKNAME_SYSTEM_INSTRUCTION = """
-Ты — аналитик по профилированию цифровой личности. Проведи глубокий поиск по никнейму: перекрестные ссылки на платформах, история смены ников, связанные аккаунты, аватарки, биографии, активность на форумах и в играх.
-Составь карту цифрового присутствия.
+Ты — аналитик профилирования цифровой личности. Перекрёстные ссылки на платформах, история ников, связанные аккаунты, аватарки, биографии, активность.
+Карта цифрового присутствия.
 
-**Форматирование ответа (ОБЯЗАТЕЛЬНО):**
-- Весь основной текст должен быть выделен **жирным шрифтом**.
-- Для второстепенных замечаний используй _курсив_.
-- Для критических выводов используй цитирование (> текст).
-- Не более 500 токенов.
+**Форматирование (MarkdownV2):** **жирный** основной, _курсив_ детали, > цитата выводы. До 500 токенов.
 """
 
 GEOOSINT_SYSTEM_INSTRUCTION = """
-Ты — эксперт военной разведки в области GeoOSINT и фотограмметрии. Твоя задача — деконструировать изображение до пикселей для точной или приблизительной локализации объекта.
-Проведи глубокий анализ по следующим паттернам:
-1. АНАЛИЗ ТЕНЕЙ И ИНСОЛЯЦИИ: Оцени направление, геометрию и длину теней. Рассчитай примерное положение солнца, азимут, сторону света и время суток.
-2. АРХИТЕКТУРНЫЙ КОД: Определи тип застройки, форму оконных рам, материал кровли, цоколи.
-3. ИНФРАСТРУКТУРНЫЕ МАРКЕРЫ: Форма дорожных знаков, разметка, светофоры, фонари, гидранты, люки, ЛЭП, госномера.
-4. СИМВОЛЫ И ТЕКСТ: Сканируй любые надписи, вывески, граффити, ценники, языковые диалекты, логотипы.
-5. БИОМЫ И КЛИМАТ: Изучи растительность, рельеф, почву, погодные условия.
+Ты — эксперт военной разведки в GeoOSINT и фотограмметрии. Деконструируй изображение до пикселей для локализации.
+1. ТЕНИ И ИНСОЛЯЦИЯ: направление, геометрия, длина теней, азимут, время суток.
+2. АРХИТЕКТУРНЫЙ КОД: застройка, окна, кровля, цоколь.
+3. ИНФРАСТРУКТУРНЫЕ МАРКЕРЫ: знаки, разметка, светофоры, фонари, гидранты, люки, ЛЭП, номера.
+4. СИМВОЛЫ И ТЕКСТ: надписи, вывески, граффити, языковые диалекты, логотипы.
+5. БИОМЫ И КЛИМАТ: растительность, рельеф, почва, погода.
 
-**Форматирование ответа (ОБЯЗАТЕЛЬНО):**
-- Весь основной текст должен быть выделен **жирным шрифтом**.
-- Для второстепенных замечаний используй _курсив_.
-- Для критических выводов используй цитирование (> текст).
-- В конце предложи готовые поисковые дорки для карт.
-- Не более 500 токенов.
+**Форматирование (MarkdownV2):** **жирный** основной, _курсив_ детали, > цитата выводы. В конце — готовые поисковые дорки для карт. До 500 токенов.
 """
 
 CASCADE_SYSTEM_INSTRUCTION = """
-Ты — элитный аналитик закрытых расследований. Собери все упоминания, связи, старые ники, возможные утечки информации.
-Очисти ответ от системных маркеров. Весь текст **жирным**, второстепенное _курсивом_, ключевые выводы в цитировании (>).
-Не более 500 токенов.
+Ты — элитный аналитик закрытых расследований. Собери упоминания, связи, старые ники, утечки.
+Очисти ответ от системных маркеров. **Жирный** текст, _курсив_ детали, > цитата выводы. До 500 токенов.
 """
 
 # ==========================================
-# REPLY КЛАВИАТУРА (постоянно под полем ввода)
+# INLINE-КЛАВИАТУРА С ЦВЕТАМИ
 # ==========================================
-def get_reply_keyboard():
-    return types.ReplyKeyboardMarkup(
-        keyboard=[
-            [
-                types.KeyboardButton(text="🌐 Универсальный"),
-                types.KeyboardButton(text="📱 Телефон")
-            ],
-            [
-                types.KeyboardButton(text="📧 Email"),
-                types.KeyboardButton(text="🧑‍💻 Ник")
-            ],
-            [
-                types.KeyboardButton(text="📸 GeoOSINT"),
-                types.KeyboardButton(text="🔄 Перезапуск")
-            ],
+def get_inline_keyboard() -> types.InlineKeyboardMarkup:
+    """Inline-меню с разными цветами (style). Привязано к сообщению, не к полю ввода."""
+    return types.InlineKeyboardMarkup(inline_keyboard=[
+        [
+            types.InlineKeyboardButton(text="🌐 Универсальный",  callback_data="mode:universal", style="primary"),
+            types.InlineKeyboardButton(text="📱 Телефон",        callback_data="mode:phone",     style="success"),
         ],
-        resize_keyboard=True,
-        input_field_placeholder="Выберите режим или отправьте цель..."
-    )
+        [
+            types.InlineKeyboardButton(text="📧 Email",          callback_data="mode:email",     style="info"),
+            types.InlineKeyboardButton(text="🧑‍💻 Ник",          callback_data="mode:nickname",  style="warning"),
+        ],
+        [
+            types.InlineKeyboardButton(text="📸 GeoOSINT",       callback_data="mode:geo",       style="success"),
+            types.InlineKeyboardButton(text="🔄 Перезапуск",     callback_data="mode:restart",   style="danger"),
+        ],
+    ])
 
 # ==========================================
-# ОБРАБОТЧИКИ КОМАНД И КНОПОК
+# БЕЗОПАСНАЯ ОТПРАВКА: MarkdownV2 + escape + fallback
+# ==========================================
+def _strip_fences(text: str) -> str:
+    """Снимает ```...``` обрамление, которое часто возвращает Gemini."""
+    text = re.sub(r"^```[a-zA-Z]*\n?", "", text.strip())
+    text = re.sub(r"\n?```\s*$", "", text)
+    return text.strip()
+
+def _trim_entities(text: str, limit: int = 4096) -> list[str]:
+    """Режет длинный текст на чанки с запасом, чтобы не упереться в лимит Telegram."""
+    return [text[i:i + limit] for i in range(0, len(text), limit)] if text else [""]
+
+async def safe_edit_text(target_message: types.Message, text: str) -> None:
+    """Edit с MarkdownV2 и экранированием. При ошибке парсинга — fallback на plain text."""
+    if not text:
+        return
+    text = _strip_fences(text)
+    try:
+        await target_message.edit_text(escape_md(text), parse_mode="MarkdownV2")
+    except TelegramBadRequest as e:
+        logging.warning(f"MarkdownV2 edit упал ({e}), отправляю plain.")
+        # Пытаемся без разметки
+        try:
+            await target_message.edit_text(text)
+        except TelegramBadRequest:
+            # Если не влезло — шлём кусками
+            for chunk in _trim_entities(text):
+                await target_message.chat.send_message(chunk)
+
+async def safe_answer(target_message: types.Message, text: str) -> types.Message | None:
+    """Answer (новое сообщение) с MarkdownV2 и fallback на plain text."""
+    if not text:
+        return None
+    text = _strip_fences(text)
+    try:
+        return await target_message.answer(escape_md(text), parse_mode="MarkdownV2")
+    except TelegramBadRequest as e:
+        logging.warning(f"MarkdownV2 answer упал ({e}), отправляю plain.")
+        try:
+            return await target_message.answer(text)
+        except TelegramBadRequest:
+            last = None
+            for chunk in _trim_entities(text):
+                last = await target_message.answer(chunk)
+            return last
+
+# ==========================================
+# ОБРАБОТЧИКИ КОМАНД И CALLBACK
 # ==========================================
 @dp.message(CommandStart())
 async def process_start_command(message: types.Message):
     welcome_text = (
         "🤖 **Терминал Агрегации Данных OSINT/GeoOSINT**\n\n"
-        "Система функционирует в штатном режиме. Нагрузка распределяется между независимыми каналами сбора данных с каскадным переключением модулей:\n"
-        "• Первичный пробив текстовых данных: **Модуль быстрого сканирования** (с выходом в Web в реальном времени).\n"
-        "• Интеллектуальный допробив и анализ изображений: **Модуль глубокой аналитики**.\n\n"
-        "_Выберите режим работы кнопкой ниже, затем отправьте цель для анализа._"
+        "Система функционирует в штатном режиме:\n"
+        "• Первичный пробив текстовых данных — **Модуль быстрого сканирования** (Web в реальном времени).\n"
+        "• Допробив и анализ изображений — **Модуль глубокой аналитики**.\n\n"
+        "_Выберите режим кнопкой ниже, затем отправьте цель для анализа._"
     )
-    await message.answer(welcome_text, parse_mode="Markdown", reply_markup=get_reply_keyboard())
-
-@dp.message(F.text == "🔄 Перезапуск")
-async def handle_restart(message: types.Message):
-    user_modes.pop(message.from_user.id, None)
-    await process_start_command(message)
-
-@dp.message(F.text.in_(["🌐 Универсальный", "📱 Телефон", "📧 Email", "🧑‍💻 Ник", "📸 GeoOSINT"]))
-async def set_mode(message: types.Message):
-    mode_map = {
-        "🌐 Универсальный": "universal",
-        "📱 Телефон": "phone",
-        "📧 Email": "email",
-        "🧑‍💻 Ник": "nickname",
-        "📸 GeoOSINT": "geo"
-    }
-    mode = mode_map[message.text]
-    user_modes[message.from_user.id] = mode
+    await safe_answer(message, welcome_text)
+    # Отдельно отправляем клавиатуру, чтобы разметка не ломала её
     await message.answer(
-        f"**Режим активирован:** {message.text}\n\n"
-        f"_Отправьте цель для анализа._",
-        parse_mode="Markdown"
+        "👇 *Панель управления:*",
+        parse_mode="MarkdownV2",
+        reply_markup=get_inline_keyboard()
     )
+
+# Callback-обработчик: одна функция на все кнопки
+@dp.callback_query(F.data.startswith("mode:"))
+async def on_mode_callback(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    action = callback.data.split(":", 1)[1]
+
+    if action == "restart":
+        user_modes.pop(user_id, None)
+        await callback.message.edit_text(
+            "🔄 *Сессия сброшена\\.*\n\nВыберите режим заново:",
+            parse_mode="MarkdownV2",
+            reply_markup=get_inline_keyboard()
+        )
+        await callback.answer("Сессия сброшена")
+        return
+
+    title_map = {
+        "universal": "🌐 Универсальный",
+        "phone":     "📱 Телефон",
+        "email":     "📧 Email",
+        "nickname":  "🧑‍💻 Ник",
+        "geo":       "📸 GeoOSINT",
+    }
+    user_modes[user_id] = action
+    title = title_map.get(action, action)
+    await callback.message.edit_text(
+        f"✅ *Режим активирован:* {escape_md(title)}\n\n"
+        f"_Отправьте цель для анализа\\._",
+        parse_mode="MarkdownV2",
+        reply_markup=get_inline_keyboard()
+    )
+    await callback.answer(f"Режим: {title}")
 
 # ==========================================
 # ЦЕНТРАЛЬНАЯ ЛОГИКА: ТЕКСТОВЫЙ OSINT (КАСКАД)
 # ==========================================
-@dp.message(F.text & ~F.text.startswith('/') & ~F.text.in_(["🌐 Универсальный", "📱 Телефон", "📧 Email", "🧑‍💻 Ник", "📸 GeoOSINT", "🔄 Перезапуск"]))
+@dp.message(F.text)
 async def handle_osint_request(message: types.Message):
     user_id = message.from_user.id
     mode = user_modes.get(user_id, "universal")
-    
-    # Выбор системного промпта и статуса в зависимости от режима
+
     if mode == "phone":
         system_prompt = PHONE_SYSTEM_INSTRUCTION
         status_text = "📱 Инициализация телефонного сканирования..."
@@ -241,8 +279,10 @@ async def handle_osint_request(message: types.Message):
     else:
         system_prompt = OSINT_SYSTEM_INSTRUCTION
         status_text = "🔍 Инициализация сканирования открытых источников..."
-    
-    status_msg = await message.answer(status_text, parse_mode="Markdown")
+
+    status_msg = await safe_answer(message, status_text)
+    if not status_msg:
+        status_msg = await message.answer(status_text)
     user_query = message.text
     final_response = ""
     used_key_flash = None
@@ -271,8 +311,8 @@ async def handle_osint_request(message: types.Message):
 
     # Шаг 2: Каскад на глубокий анализ
     if "[TRIGGER_CASCADE_PRO]" in final_response or not final_response:
-        await status_msg.edit_text("🎯 Переключение на глубокий аналитический режим...")
-        
+        await safe_edit_text(status_msg, "🎯 Переключение на глубокий аналитический режим...")
+
         for attempt in range(4):
             try:
                 used_key_pro = rotator.get_best_key()
@@ -294,24 +334,31 @@ async def handle_osint_request(message: types.Message):
                     is_429 = "429" in str(e) or "quota" in str(e).lower()
                     rotator.report_failure(used_key_pro, is_quota_issue=is_429)
 
-    # Форматированный вывод
     if final_response:
         final_response = final_response.replace("[TRIGGER_CASCADE_PRO]", "").strip()
         if len(final_response) > 4096:
-            for chunk in range(0, len(final_response), 4096):
-                await message.answer(final_response[chunk:chunk+4096], parse_mode="Markdown")
+            chunks = _trim_entities(final_response, 3500)  # запас под экранирование
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+            for chunk in chunks:
+                await safe_answer(message, chunk)
         else:
-            await status_msg.edit_text(final_response, parse_mode="Markdown")
+            await safe_edit_text(status_msg, final_response)
     else:
-        await status_msg.edit_text("❌ Критическая ошибка: Не удалось получить ответ от аналитического кластера. Проверьте лимиты аккаунтов в панели управления.")
+        await safe_edit_text(
+            status_msg,
+            "❌ Критическая ошибка: Не удалось получить ответ от аналитического кластера. Проверьте лимиты аккаунтов."
+        )
 
 # ==========================================
 # ЦЕНТРАЛЬНАЯ ЛОГИКА: ВИЗУАЛЬНЫЙ GEOOSINT
 # ==========================================
 @dp.message(F.photo)
 async def handle_geo_photo(message: types.Message, bot: Bot):
-    status_msg = await message.answer("📸 Получено изображение. Запускаю визуальную деконструкцию объекта...", parse_mode="Markdown")
-    
+    status_msg = await safe_answer(message, "📸 Получено изображение. Запускаю визуальную деконструкцию объекта...")
+
     photo = message.photo[-1]
     file_info = await bot.get_file(photo.file_id)
     photo_buffer = await bot.download_file(file_info.file_path)
@@ -334,33 +381,55 @@ async def handle_geo_photo(message: types.Message, bot: Bot):
                 )
             )
             rotator.report_success(active_key)
-            
-            answer_text = response.text
+
+            answer_text = response.text or ""
             if len(answer_text) > 4096:
-                for chunk in range(0, len(answer_text), 4096):
-                    await message.answer(answer_text[chunk:chunk+4096], parse_mode="Markdown")
+                chunks = _trim_entities(answer_text, 3500)
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+                for chunk in chunks:
+                    await safe_answer(message, chunk)
             else:
-                await status_msg.edit_text(answer_text, parse_mode="Markdown")
+                await safe_edit_text(status_msg, answer_text)
             return
         except Exception as e:
             if active_key:
                 is_429 = "429" in str(e) or "quota" in str(e).lower()
                 rotator.report_failure(active_key, is_quota_issue=is_429)
 
-    await status_msg.edit_text("❌ Не удалось произвести визуальный анализ. Все доступные API-ключи исчерпали лимиты запросов.")
+    await safe_edit_text(
+        status_msg,
+        "❌ Не удалось произвести визуальный анализ. Все доступные API-ключи исчерпали лимиты запросов."
+    )
+
+# ==========================================
+# FALLBACK ДЛЯ НЕОПОЗНАННЫХ СООБЩЕНИЙ
+# ==========================================
+@dp.message()
+async def fallback_handler(message: types.Message):
+    await safe_answer(
+        message,
+        "⚠️ Не удалось распознать сообщение. Выберите режим ниже и повторите запрос."
+    )
+    await message.answer(
+        "👇 *Панель управления:*",
+        parse_mode="MarkdownV2",
+        reply_markup=get_inline_keyboard()
+    )
 
 # ==========================================
 # ТОЧКА ВХОДА ДЛЯ RAILWAY
 # ==========================================
 async def start_application():
     if not TELEGRAM_BOT_TOKEN or not GOOGLE_API_KEYS_RAW:
-        logging.critical("🛑 Запуск невозможен. Проверьте переменные окружения в настройках Railway!")
+        logging.critical("🛑 Запуск невозможен. Проверьте переменные окружения в Railway!")
         return
-        
+
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
-    logging.info("🚀 OSINT/GeoOSINT Бот успешно запущен через переменные окружения.")
+    logging.info("🚀 OSINT/GeoOSINT Бот успешно запущен.")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(start_application())
-        
