@@ -27,8 +27,8 @@ if not GOOGLE_API_KEYS_RAW:
     logging.critical("🚨 Ошибка: Переменная окружения 'GOOGLE_API_KEYS' не установлена!")
 
 # Идентификаторы актуальных моделей линейки Gemini 3.x
-MODEL_OSINT_FLASH = "gemini-3.5-flash"
-MODEL_GEO_PRO = "gemini-3.1-pro"
+MODEL_OSINT_FLASH = "gemini-2.5-flash"
+MODEL_GEO_PRO = "gemini-2.5-flash"
 
 # ==========================================
 # ИНТЕЛЛЕКТУАЛЬНЫЙ СУПЕР-РОТАТОР КЛЮЧЕЙ
