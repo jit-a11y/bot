@@ -16,7 +16,7 @@ from aiogram.enums import PollType
 from aiogram.exceptions import TelegramBadRequest
 
 TOKEN = "8856153501:AAHZFL5BZavIWnZK_Nset5qTo0yVYby668c"
-CHANNEL_ID = -1002640635653      
+CHANNEL_ID = -1002640635653     
 MOD_CHAT_ID = -1003932113244     
 RULES_LINK = "https://t.me/+wd4SPOWd68MzNGE6"
 COMMENTS_CHAT_ID = -1002837559442 
