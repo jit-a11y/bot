@@ -17,7 +17,7 @@ from aiogram.exceptions import TelegramBadRequest
 
 TOKEN = "8980757911:AAEEfxngWvGhCEjSGkQRuakSq4gocqCYUvg"
 CHANNEL_ID = -1002313831349     
-MOD_CHAT_ID = -1004252414187     
+MOD_CHAT_ID = -1004252414187    
 RULES_LINK = "https://telegra.ph/Reglament-06-13-3"
 COMMENTS_CHAT_ID = -1002567209067 
 
